@@ -424,10 +424,17 @@ document.addEventListener('DOMContentLoaded', () => {
         const btnBackup = document.getElementById('sbs-btn-manual-backup');
         if (btnBackup) btnBackup.addEventListener('click', () => {
             const statusDiv = document.getElementById('sbs-backup-status');
-            statusDiv.innerText = 'Queuing backup job...';
+            statusDiv.innerText = 'Creating single ZIP (this may take a few minutes)...';
+            btnBackup.disabled = true;
             sendAjax('sbs_run_manual_backup', {}, (res) => {
-                statusDiv.innerText = `Job Queued (ID: ${res.data.job_id}). Building archive in background.`;
-                setTimeout(loadBackups, 3000);
+                const name = res.data.filename || '';
+                const size = res.data.size ? ` (${res.data.size} bytes)` : '';
+                statusDiv.innerText = res.data.message + (name ? ' File: ' + name + size : '');
+                btnBackup.disabled = false;
+                loadBackups();
+            }, (errMsg) => {
+                statusDiv.innerText = 'Backup failed: ' + errMsg;
+                btnBackup.disabled = false;
             });
         });
 
@@ -586,30 +593,52 @@ document.addEventListener('DOMContentLoaded', () => {
         listDiv.innerHTML = 'Loading archives...';
         sendAjax('sbs_get_backups', {}, (res) => {
             if (!res.data.backups || res.data.backups.length === 0) {
-                listDiv.innerHTML = '<p style="color:#64748b;">No backup archives found in sbs-storage.</p>'; return;
+                listDiv.innerHTML = '<p style="color:#64748b;">No complete .zip backups found in sbs-storage.</p>';
+                return;
             }
-            let html = `<table class="sbs-table"><thead><tr><th>Filename</th><th>Size</th><th>Date</th><th style="text-align:right;">Actions</th></tr></thead><tbody>`;
+            let html = `<table class="sbs-table"><thead><tr><th>Filename</th><th>Size</th><th>Date (UTC)</th><th style="text-align:right;">Actions</th></tr></thead><tbody>`;
             res.data.backups.forEach(b => {
-                html += `<tr><td style="font-family:monospace;">${b.name}</td><td>${b.size}</td><td>${b.date}</td><td style="text-align:right;">
-                    <button class="sbs-btn sbs-btn--secondary sbs-act-dl" data-file="${b.name}" style="padding:4px 8px; font-size:11px; background:#059669;">Download</button>
-                    <button class="sbs-btn sbs-btn--secondary sbs-act-ren" data-file="${b.name}" style="padding:4px 8px; font-size:11px;">Rename</button>
-                    <button class="sbs-btn sbs-btn--secondary sbs-act-del" data-file="${b.name}" style="padding:4px 8px; font-size:11px; background:#dc2626;">Delete</button>
-                </td></tr>`;
+                const name = b.filename || b.name || '';
+                const sizeLabel = b.size_h || b.size || '';
+                const dl = b.download || ((window.sbsData.adminUrl || (window.sbsData.ajaxUrl.replace('admin-ajax.php', 'admin.php'))) + '?page=sbs-toolkit&sbs_download_backup=' + encodeURIComponent(name) + '&nonce=' + encodeURIComponent(window.sbsData.nonce));
+                html += `<tr>
+                    <td style="font-family:monospace;">${name}</td>
+                    <td>${sizeLabel}</td>
+                    <td>${b.date || ''}</td>
+                    <td style="text-align:right; white-space:nowrap;">
+                        <a class="sbs-btn sbs-btn--secondary" href="${dl}" style="padding:4px 8px; font-size:11px; background:#059669; text-decoration:none;">Download</a>
+                        <button type="button" class="sbs-btn sbs-btn--secondary sbs-act-ren" data-file="${name}" style="padding:4px 8px; font-size:11px;">Rename</button>
+                        <button type="button" class="sbs-btn sbs-btn--secondary sbs-act-res" data-file="${name}" style="padding:4px 8px; font-size:11px; background:#d97706;">Restore</button>
+                        <button type="button" class="sbs-btn sbs-btn--secondary sbs-act-del" data-file="${name}" style="padding:4px 8px; font-size:11px; background:#dc2626;">Delete</button>
+                    </td>
+                </tr>`;
             });
             listDiv.innerHTML = html + `</tbody></table>`;
-            listDiv.querySelectorAll('.sbs-act-dl').forEach(btn => btn.addEventListener('click', (e) => window.location.href = window.sbsData.ajaxUrl.replace('admin-ajax.php', '') + `admin.php?page=sbs-toolkit&sbs_download_backup=${e.target.getAttribute('data-file')}&nonce=${window.sbsData.nonce}`));
+
             listDiv.querySelectorAll('.sbs-act-ren').forEach(btn => btn.addEventListener('click', (e) => {
                 const oldFile = e.target.getAttribute('data-file');
-                const newFile = prompt('Enter new filename (.zip / .tar.gz):', oldFile);
-                if (newFile && newFile !== oldFile) sendAjax('sbs_rename_backup', { old_name: oldFile, new_name: newFile }, () => loadBackups());
+                const newFile = prompt('Enter new filename (must end with .zip):', oldFile);
+                if (newFile && newFile !== oldFile) {
+                    sendAjax('sbs_rename_backup', { old_name: oldFile, new_name: newFile }, () => loadBackups());
+                }
             }));
             listDiv.querySelectorAll('.sbs-act-del').forEach(btn => btn.addEventListener('click', (e) => {
-                if(confirm('Delete backup?')) sendAjax('sbs_delete_backup', { filename: e.target.getAttribute('data-file') }, () => loadBackups());
+                if (confirm('Delete this backup permanently?')) {
+                    sendAjax('sbs_delete_backup', { filename: e.target.getAttribute('data-file') }, () => loadBackups());
+                }
+            }));
+            listDiv.querySelectorAll('.sbs-act-res').forEach(btn => btn.addEventListener('click', (e) => {
+                const file = e.target.getAttribute('data-file');
+                if (!confirm('RESTORE will overwrite site files (except wp-config.php) and import database.sql from this zip.\\n\\nContinue?')) return;
+                if (!confirm('Type confirmation: this cannot be easily undone. Proceed with restore of ' + file + '?')) return;
+                sendAjax('sbs_restore_backup', { filename: file, confirm: '1' }, (res) => {
+                    alert(res.data.message + '\\nFiles: ' + (res.data.restored_files || 0) + '\\nDB: ' + (res.data.db_imported ? 'yes' : 'no'));
+                });
             }));
         });
     }
 
-    function loadBanList() {
+function loadBanList() {
         const listDiv = document.getElementById('sbs-ban-list');
         if (!listDiv) return;
         listDiv.innerText = 'Loading...';
@@ -620,19 +649,35 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function sendAjax(action, payload, callback) {
+    function sendAjax(action, payload, callback, errorCallback) {
         const body = new URLSearchParams();
         body.append('action', action);
         body.append('nonce', window.sbsData.nonce);
         for (let key in payload) {
-            if (typeof payload[key] === 'object' && payload[key] !== null) {
+            if (Array.isArray(payload[key])) {
+                payload[key].forEach((v, i) => body.append(key + '[' + i + ']', typeof v === 'object' ? JSON.stringify(v) : v));
+            } else if (typeof payload[key] === 'object' && payload[key] !== null) {
                 for (let subKey in payload[key]) body.append(`${key}[${subKey}]`, payload[key][subKey]);
             } else {
                 body.append(key, payload[key]);
             }
         }
-        fetch(window.sbsData.ajaxUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
-        .then(r => r.json()).then(res => res.success ? callback(res) : alert(res.data.message || window.sbsData.i18n.error)).catch(() => alert('Request failed.'));
+        fetch(window.sbsData.ajaxUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body, credentials: 'same-origin' })
+        .then(r => r.json())
+        .then(res => {
+            if (res.success) {
+                if (callback) callback(res);
+            } else {
+                const msg = (res.data && res.data.message) ? res.data.message : window.sbsData.i18n.error;
+                if (errorCallback) errorCallback(msg);
+                else alert(msg);
+            }
+        })
+        .catch(() => {
+            const msg = 'Request failed.';
+            if (errorCallback) errorCallback(msg);
+            else alert(msg);
+        });
     }
 
     render();
