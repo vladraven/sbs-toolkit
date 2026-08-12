@@ -22,7 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
         
         root.innerHTML = `
             <header class="sbs-header">
-                <h1 class="sbs-header__title">${state.settings.devops?.wl_plugin_name || 'SBS Toolkit'} <small style="font-size:12px;opacity:0.7;">v1.0.3</small></h1>
+                <h1 class="sbs-header__title">${state.settings.devops?.wl_plugin_name || 'SBS Toolkit'} <small style="font-size:12px;opacity:0.7;">v${window.sbsData.pluginVersion || '1.0.4'}</small></h1>
                 <span class="sbs-header__badge ${badgeClass}">${window.sbsData.licenseStatus.toUpperCase()}</span>
             </header>
             <div class="sbs-layout">
@@ -119,41 +119,68 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderBackupTab(isLocked) {
-        const safeUpdates = state.settings.backup?.safe_updates_enabled ? 'checked' : '';
-        const ftpEnabled = state.settings.backup?.remote?.ftp_enabled ? 'checked' : '';
-        const s3Enabled = state.settings.backup?.remote?.s3_enabled ? 'checked' : '';
-        
+        const b = state.settings.backup || {};
+        const remote = b.remote || {};
+        const safeUpdates = b.safe_updates_enabled ? 'checked' : '';
+        const excludeThumbs = b.exclude_thumbs === undefined || b.exclude_thumbs ? 'checked' : '';
+        const ftpEnabled = remote.ftp_enabled ? 'checked' : '';
+        const s3Enabled = remote.s3_enabled ? 'checked' : '';
+        const schedule = b.schedule || 'off';
+        const retention = b.retention_count || (window.sbsData.isProOrTrial ? '14' : '1');
+        const proOnly = !window.sbsData.isProOrTrial;
+        const proDisabled = (isLocked || proOnly) ? 'disabled' : '';
+        const freeNote = proOnly
+            ? '<p style="color:#b45309;font-size:13px;margin:0 0 12px;">Free plan: 1 local backup, no schedule, no remote upload. Upgrade to Pro for automation.</p>'
+            : '';
+
         return `
             <h2>Smart Backup & Migration</h2>
+            ${freeNote}
             <form id="sbs-form-backup" data-module="backup">
                 <div class="sbs-card">
                     <div class="sbs-form-group">
-                        <label><input type="checkbox" name="safe_updates_enabled" value="1" ${safeUpdates} ${isLocked ? 'disabled' : ''}> Enable Safe Updates</label>
+                        <label><input type="checkbox" name="safe_updates_enabled" value="1" ${safeUpdates} ${isLocked ? 'disabled' : ''}> Enable Safe Updates (snapshot before plugin/theme update)</label>
                     </div>
-                    <h3 style="margin-top:24px;">Remote Storage (Optional)</h3>
                     <div class="sbs-form-group">
-                        <label><input type="checkbox" name="remote[ftp_enabled]" value="1" ${ftpEnabled} ${isLocked ? 'disabled' : ''}> Upload to FTP</label>
+                        <label><input type="checkbox" name="exclude_thumbs" value="1" ${excludeThumbs} ${isLocked ? 'disabled' : ''}> Exclude generated image thumbnails (-WxH) from archive</label>
+                    </div>
+                    <div class="sbs-form-group">
+                        <label>Schedule (Pro)</label>
+                        <select name="schedule" class="sbs-input" ${proDisabled}>
+                            <option value="off" ${schedule === 'off' ? 'selected' : ''}>Off (manual only)</option>
+                            <option value="daily" ${schedule === 'daily' ? 'selected' : ''}>Daily</option>
+                            <option value="weekly" ${schedule === 'weekly' ? 'selected' : ''}>Weekly</option>
+                        </select>
+                    </div>
+                    <div class="sbs-form-group">
+                        <label>Retention — keep last N backups (Pro)</label>
+                        <input type="number" name="retention_count" class="sbs-input" min="1" max="90" value="${retention}" ${proDisabled}>
+                    </div>
+                    <h3 style="margin-top:24px;">Remote Storage (Pro, optional)</h3>
+                    <div class="sbs-form-group">
+                        <label><input type="checkbox" name="remote[ftp_enabled]" value="1" ${ftpEnabled} ${proDisabled}> Upload to FTP after backup</label>
                     </div>
                     <div class="sbs-form-group" style="margin-left: 20px;">
-                        <input type="text" name="remote[ftp_host]" class="sbs-input" placeholder="FTP Host" value="${state.settings.backup?.remote?.ftp_host || ''}" ${isLocked ? 'disabled' : ''} style="margin-bottom: 5px;">
-                        <input type="text" name="remote[ftp_user]" class="sbs-input" placeholder="FTP User" value="${state.settings.backup?.remote?.ftp_user || ''}" ${isLocked ? 'disabled' : ''} style="margin-bottom: 5px;">
-                        <input type="password" name="remote[ftp_pass]" class="sbs-input" placeholder="FTP Password" value="${state.settings.backup?.remote?.ftp_pass || ''}" ${isLocked ? 'disabled' : ''} style="margin-bottom: 5px;">
-                        <input type="text" name="remote[ftp_dir]" class="sbs-input" placeholder="Remote Directory" value="${state.settings.backup?.remote?.ftp_dir || '/'}" ${isLocked ? 'disabled' : ''}>
+                        <input type="text" name="remote[ftp_host]" class="sbs-input" placeholder="FTP Host" value="${remote.ftp_host || ''}" ${proDisabled} style="margin-bottom: 5px;">
+                        <input type="text" name="remote[ftp_user]" class="sbs-input" placeholder="FTP User" value="${remote.ftp_user || ''}" ${proDisabled} style="margin-bottom: 5px;">
+                        <input type="password" name="remote[ftp_pass]" class="sbs-input" placeholder="FTP Password" value="${remote.ftp_pass || ''}" ${proDisabled} style="margin-bottom: 5px;">
+                        <input type="text" name="remote[ftp_dir]" class="sbs-input" placeholder="Remote Directory" value="${remote.ftp_dir || '/'}" ${proDisabled}>
                     </div>
                     <div class="sbs-form-group" style="margin-top:15px;">
-                        <label><input type="checkbox" name="remote[s3_enabled]" value="1" ${s3Enabled} ${isLocked ? 'disabled' : ''}> Upload to AWS S3 / Compatible</label>
+                        <label><input type="checkbox" name="remote[s3_enabled]" value="1" ${s3Enabled} ${proDisabled}> Upload to AWS S3 / Compatible</label>
                     </div>
                     <div class="sbs-form-group" style="margin-left: 20px;">
-                        <input type="text" name="remote[s3_key]" class="sbs-input" placeholder="Access Key" value="${state.settings.backup?.remote?.s3_key || ''}" ${isLocked ? 'disabled' : ''} style="margin-bottom: 5px;">
-                        <input type="password" name="remote[s3_secret]" class="sbs-input" placeholder="Secret Key" value="${state.settings.backup?.remote?.s3_secret || ''}" ${isLocked ? 'disabled' : ''} style="margin-bottom: 5px;">
-                        <input type="text" name="remote[s3_bucket]" class="sbs-input" placeholder="Bucket Name" value="${state.settings.backup?.remote?.s3_bucket || ''}" ${isLocked ? 'disabled' : ''} style="margin-bottom: 5px;">
-                        <input type="text" name="remote[s3_region]" class="sbs-input" placeholder="Region" value="${state.settings.backup?.remote?.s3_region || ''}" ${isLocked ? 'disabled' : ''}>
+                        <input type="text" name="remote[s3_key]" class="sbs-input" placeholder="Access Key" value="${remote.s3_key || ''}" ${proDisabled} style="margin-bottom: 5px;">
+                        <input type="password" name="remote[s3_secret]" class="sbs-input" placeholder="Secret Key" value="${remote.s3_secret || ''}" ${proDisabled} style="margin-bottom: 5px;">
+                        <input type="text" name="remote[s3_bucket]" class="sbs-input" placeholder="Bucket Name" value="${remote.s3_bucket || ''}" ${proDisabled} style="margin-bottom: 5px;">
+                        <input type="text" name="remote[s3_region]" class="sbs-input" placeholder="Region" value="${remote.s3_region || ''}" ${proDisabled}>
                     </div>
                     <button type="submit" class="sbs-btn" style="margin-top:16px;" ${isLocked ? 'disabled' : ''}>Save Settings</button>
                 </div>
             </form>
             <div class="sbs-card">
                 <h3>Manual Action</h3>
+                <p style="font-size:13px;color:#64748b;">Creates one complete <code>.zip</code> (full site + database.sql) in <code>wp-content/sbs-storage/</code>.</p>
                 <button class="sbs-btn sbs-btn--secondary" id="sbs-btn-manual-backup" ${isLocked ? 'disabled' : ''}>Run Full Backup Now</button>
                 <div id="sbs-backup-status" style="margin-top:10px; font-weight:bold;"></div>
             </div>
@@ -165,7 +192,8 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
     }
 
-    function renderPerformanceTab(isLocked) {
+    
+function renderPerformanceTab(isLocked) {
         const set = state.settings.performance || {};
         return `
             <h2>Setup & Performance</h2>
