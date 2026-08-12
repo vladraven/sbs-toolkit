@@ -8,6 +8,7 @@ use Vlad\SBS\Core\ModuleInterface;
 use Vlad\SBS\Core\SettingsManager;
 
 final class DeceptionModule implements ModuleInterface {
+
 	public function get_id(): string {
 		return 'deception';
 	}
@@ -17,7 +18,11 @@ final class DeceptionModule implements ModuleInterface {
 	}
 
 	public function boot(): void {
-		// PHP Fallback для серверов Nginx, где не работает .htaccess
+		// Master switch — default OFF so Soft-Lock / Free never auto-bans traffic.
+		if ( ! SettingsManager::get( 'deception', 'module_enabled', false ) ) {
+			return;
+		}
+
 		add_action( 'init', [ BanEngine::class, 'enforce_php_bans' ], 1 );
 
 		$honeypot = new HoneypotEngine();
@@ -30,14 +35,17 @@ final class DeceptionModule implements ModuleInterface {
 	}
 
 	public function apply_soft_lock_ui(): void {
-		add_action( 'wp_ajax_sbs_unban_ip', function (): void {
-			wp_send_json_error( [ 'message' => __( 'Action locked in Free mode.', 'sbs' ) ], 403 );
-		} );
-		// Просмотр забаненных оставляем доступным
+		// Emergency: always allow unban + list for admins (prevents self-lockout).
 		add_action( 'wp_ajax_sbs_get_banned_ips', [ BanEngine::class, 'ajax_get_banned_ips' ] );
+		add_action( 'wp_ajax_sbs_unban_ip', [ BanEngine::class, 'ajax_unban_ip' ] );
 	}
 
 	public function uninstall(): void {
 		delete_option( 'sbs_banned_ips' );
+		// Clear htaccess markers.
+		if ( file_exists( ABSPATH . '.htaccess' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/file.php';
+			insert_with_markers( ABSPATH . '.htaccess', 'SBS_TOOLKIT_BANS', [] );
+		}
 	}
 }

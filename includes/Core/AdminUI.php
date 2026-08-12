@@ -39,43 +39,44 @@ final class AdminUI {
 			return;
 		}
 
-		wp_enqueue_style(
-			'sbs-admin-css',
-			SBS_PLUGIN_URL . 'assets/css/admin.css',
-			[],
-			SBS_VERSION
-		);
+		wp_enqueue_style( 'sbs-admin-css', SBS_PLUGIN_URL . 'assets/css/admin.css', [], SBS_VERSION );
+		wp_enqueue_script( 'sbs-admin-js', SBS_PLUGIN_URL . 'assets/js/admin.js', [], SBS_VERSION, true );
 
-		wp_enqueue_script(
-			'sbs-admin-js',
-			SBS_PLUGIN_URL . 'assets/js/admin.js',
-			[],
-			SBS_VERSION,
-			true
-		);
-
-		$active_free_module = get_option( 'sbs_active_free_module', 'performance' );
+		$active_free_module = (string) get_option( 'sbs_active_free_module', 'performance' );
 		$is_pro_or_trial    = $this->license->is_pro_or_trial();
+		$switch_date        = (int) get_option( 'sbs_module_switch_date', 0 );
+		$days_used          = $switch_date > 0 ? (int) floor( ( time() - $switch_date ) / DAY_IN_SECONDS ) : 30;
+		$settings_raw       = get_option( 'sbs_settings', '{}' );
+		$settings           = json_decode( is_string( $settings_raw ) ? $settings_raw : '{}', true );
+		if ( ! is_array( $settings ) ) {
+			$settings = [];
+		}
 
 		wp_localize_script( 'sbs-admin-js', 'sbsData', [
 			'ajaxUrl'          => admin_url( 'admin-ajax.php' ),
+			'adminUrl'         => admin_url( 'admin.php' ),
 			'nonce'            => wp_create_nonce( 'sbs_admin_nonce' ),
-			'licenseStatus'    => get_option( 'sbs_license_status', 'free' ),
+			'licenseStatus'    => $this->license->get_status(),
 			'isProOrTrial'     => $is_pro_or_trial,
 			'activeFreeModule' => $active_free_module,
 			'canSwitchModule'  => $this->license->can_switch_free_module(),
-			'switchDaysLeft'   => max( 0, 30 - (int) floor( ( time() - (int) get_option( 'sbs_module_switch_date', 0 ) ) / DAY_IN_SECONDS ) ),
-			'settings'         => json_decode( (string) get_option( 'sbs_settings', '{}' ), true ),
+			'switchDaysLeft'   => max( 0, 30 - $days_used ),
+			'settings'         => $settings,
 			'i18n'             => [
 				'saved'        => __( 'Settings saved successfully.', 'sbs' ),
 				'error'        => __( 'An error occurred.', 'sbs' ),
 				'lockedNotice' => __( 'This module is in Soft-Lock mode (Read-Only). Upgrade to Pro or select it as your active Free module to edit.', 'sbs' ),
-			]
+				'activated'    => __( 'Pro License activated!', 'sbs' ),
+				'invalidKey'   => __( 'Invalid or expired license key.', 'sbs' ),
+			],
 		] );
 	}
 
 	public function render_app_container(): void {
-		echo '<div id="sbs-app-root" class="sbs-app"></div>';
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		echo '<div class="wrap"><div id="sbs-app-root">Loading SBS Toolkit…</div></div>';
 	}
 
 	public function ajax_save_settings(): void {
@@ -84,39 +85,42 @@ final class AdminUI {
 			wp_send_json_error( [ 'message' => 'Unauthorized' ], 403 );
 		}
 
-		$module_id = sanitize_key( $_POST['module_id'] ?? '' );
-		$data      = $_POST['settings'] ?? [];
-
-		$is_pro_or_trial = $this->license->is_pro_or_trial();
-		$active_free     = get_option( 'sbs_active_free_module', 'performance' );
-
-		if ( ! $is_pro_or_trial && $active_free !== $module_id ) {
-			wp_send_json_error( [ 'message' => __( 'Cannot save: Module is Soft-Locked.', 'sbs' ) ], 403 );
+		$module_id = sanitize_key( wp_unslash( $_POST['module_id'] ?? '' ) );
+		$settings  = $_POST['settings'] ?? [];
+		if ( ! is_array( $settings ) || $module_id === '' ) {
+			wp_send_json_error( [ 'message' => __( 'Invalid payload.', 'sbs' ) ] );
 		}
 
-		if ( ! is_array( $data ) ) {
-			wp_send_json_error( [ 'message' => __( 'Invalid payload.', 'sbs' ) ], 400 );
+		if ( ! $this->license->is_pro_or_trial() ) {
+			$active = (string) get_option( 'sbs_active_free_module', 'performance' );
+			if ( $module_id !== $active ) {
+				wp_send_json_error( [ 'message' => __( 'Module is soft-locked.', 'sbs' ) ], 403 );
+			}
 		}
 
-		$sanitized_data = $this->sanitize_array_recursive( wp_unslash( $data ) );
-
-		foreach ( $sanitized_data as $key => $val ) {
-			SettingsManager::set( $module_id, sanitize_key( $key ), $val );
+		$sanitized = $this->sanitize_array_recursive( $settings );
+		$all_raw   = get_option( 'sbs_settings', '{}' );
+		$all       = json_decode( is_string( $all_raw ) ? $all_raw : '{}', true );
+		if ( ! is_array( $all ) ) {
+			$all = [];
 		}
+		$all[ $module_id ] = $sanitized;
+		update_option( 'sbs_settings', wp_json_encode( $all ), false );
 
-		wp_send_json_success( [ 'message' => __( 'Settings updated.', 'sbs' ) ] );
+		wp_send_json_success( [ 'message' => __( 'Settings saved successfully.', 'sbs' ) ] );
 	}
 
 	private function sanitize_array_recursive( array $array ): array {
-		$sanitized = [];
+		$clean = [];
 		foreach ( $array as $key => $value ) {
+			$k = is_string( $key ) ? sanitize_key( $key ) : $key;
 			if ( is_array( $value ) ) {
-				$sanitized[ sanitize_key( $key ) ] = $this->sanitize_array_recursive( $value );
+				$clean[ $k ] = $this->sanitize_array_recursive( $value );
 			} else {
-				$sanitized[ sanitize_key( $key ) ] = sanitize_text_field( (string) $value );
+				$clean[ $k ] = sanitize_text_field( (string) $value );
 			}
 		}
-		return $sanitized;
+		return $clean;
 	}
 
 	public function ajax_activate_license(): void {
@@ -126,13 +130,19 @@ final class AdminUI {
 		}
 
 		$key = sanitize_text_field( wp_unslash( $_POST['license_key'] ?? '' ) );
-		if ( $this->license->verify_key( $key ) ) {
-			update_option( 'sbs_license_key', $key );
-			update_option( 'sbs_license_status', 'pro' );
-			wp_send_json_success( [ 'message' => __( 'Pro License activated!', 'sbs' ) ] );
-		} else {
-			wp_send_json_error( [ 'message' => __( 'Invalid or expired license key.', 'sbs' ) ] );
+		if ( $key === '' ) {
+			wp_send_json_error( [ 'message' => __( 'License key is empty.', 'sbs' ) ] );
 		}
+
+		if ( $this->license->activate_key( $key ) ) {
+			Logger::log( 'core', 'info', 'Pro license activated.' );
+			wp_send_json_success( [
+				'message' => __( 'Pro License activated!', 'sbs' ),
+				'status'  => 'pro',
+			] );
+		}
+
+		wp_send_json_error( [ 'message' => __( 'Invalid or expired license key.', 'sbs' ) ] );
 	}
 
 	public function ajax_switch_free_module(): void {
@@ -141,12 +151,12 @@ final class AdminUI {
 			wp_send_json_error( [ 'message' => 'Unauthorized' ], 403 );
 		}
 
-		$module_id = sanitize_key( $_POST['module_id'] ?? '' );
+		$module_id = sanitize_key( wp_unslash( $_POST['module_id'] ?? '' ) );
 		if ( $this->license->set_active_free_module( $module_id ) ) {
 			wp_send_json_success( [ 'message' => __( 'Active Free module switched.', 'sbs' ) ] );
-		} else {
-			wp_send_json_error( [ 'message' => __( 'You can only switch your active Free module once every 30 days.', 'sbs' ) ] );
 		}
+
+		wp_send_json_error( [ 'message' => __( 'You can only switch your active Free module once every 30 days.', 'sbs' ) ] );
 	}
 
 	public function ajax_export_settings(): void {
@@ -156,7 +166,7 @@ final class AdminUI {
 		}
 
 		$settings = get_option( 'sbs_settings', '{}' );
-		wp_send_json_success( [ 'json' => $settings ] );
+		wp_send_json_success( [ 'json' => is_string( $settings ) ? $settings : '{}' ] );
 	}
 
 	public function ajax_import_settings(): void {
@@ -172,9 +182,7 @@ final class AdminUI {
 			wp_send_json_error( [ 'message' => __( 'Invalid JSON format.', 'sbs' ) ] );
 		}
 
-		$sanitized_data = $this->sanitize_array_recursive( $data );
-
-		update_option( 'sbs_settings', wp_json_encode( $sanitized_data ) );
+		update_option( 'sbs_settings', wp_json_encode( $this->sanitize_array_recursive( $data ) ), false );
 		wp_send_json_success( [ 'message' => __( 'Settings imported successfully. Please reload the page.', 'sbs' ) ] );
 	}
 
@@ -186,8 +194,9 @@ final class AdminUI {
 
 		global $wpdb;
 		$table = $wpdb->prefix . 'sbs_logs';
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$logs  = $wpdb->get_results( "SELECT * FROM {$table} ORDER BY id DESC LIMIT 100", ARRAY_A );
 
-		wp_send_json_success( [ 'logs' => $logs ] );
+		wp_send_json_success( [ 'logs' => is_array( $logs ) ? $logs : [] ] );
 	}
 }

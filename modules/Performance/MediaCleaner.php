@@ -7,76 +7,92 @@ namespace Vlad\SBS\Modules\Performance;
 use Vlad\SBS\Core\Logger;
 
 final class MediaCleaner {
+
 	public static function ajax_scan_orphans(): void {
 		check_ajax_referer( 'sbs_admin_nonce', 'nonce' );
 		if ( ! current_user_can( 'manage_options' ) ) {
 			wp_send_json_error( [ 'message' => 'Unauthorized' ], 403 );
 		}
 
-		global $wpdb;
 		$upload_dir = wp_upload_dir();
-		$base_dir   = trailingslashit( $upload_dir['basedir'] );
-		$base_url   = trailingslashit( $upload_dir['baseurl'] );
+		$base_dir   = isset( $upload_dir['basedir'] ) ? (string) $upload_dir['basedir'] : '';
+		$base_url   = isset( $upload_dir['baseurl'] ) ? (string) $upload_dir['baseurl'] : '';
 
-		// 1. Формируем хэш-карту легитимных файлов (Один быстрый запрос)
-		$registered_files = $wpdb->get_col( "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file'" );
+		$base_real = $base_dir !== '' ? realpath( $base_dir ) : false;
+		if ( $base_real === false || ! is_dir( $base_real ) ) {
+			wp_send_json_error( [ 'message' => __( 'Uploads directory not found.', 'sbs' ) ] );
+		}
+		$base_real = wp_normalize_path( $base_real );
+
+		global $wpdb;
+		$registered   = $wpdb->get_col( "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_wp_attached_file'" );
 		$valid_lookup = [];
-		foreach ( $registered_files as $file ) {
-			$valid_lookup[ $file ] = true;
+		if ( is_array( $registered ) ) {
+			foreach ( $registered as $file ) {
+				$file = ltrim( str_replace( '\\', '/', (string) $file ), '/' );
+				if ( $file !== '' ) {
+					$valid_lookup[ $file ] = true;
+				}
+			}
 		}
 
 		$orphans    = [];
 		$total_size = 0;
 
-		// 2. Итерируем файлы
-		if ( is_dir( $base_dir ) ) {
-			$iterator = new \RecursiveIteratorIterator(
-				new \RecursiveDirectoryIterator( $base_dir, \FilesystemIterator::SKIP_DOTS ),
-				\RecursiveIteratorIterator::LEAVES_ONLY
-			);
+		$iterator = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( $base_real, \FilesystemIterator::SKIP_DOTS ),
+			\RecursiveIteratorIterator::LEAVES_ONLY
+		);
 
-			foreach ( $iterator as $file ) {
-				if ( $file->isDir() ) {
-					continue;
-				}
+		foreach ( $iterator as $file ) {
+			/** @var \SplFileInfo $file */
+			if ( ! $file->isFile() ) {
+				continue;
+			}
 
-				$real_path     = $file->getRealPath();
-				$relative_path = substr( $real_path, strlen( $base_dir ) );
-				$relative_path = str_replace( '\\', '/', $relative_path );
+			$real_path = $file->getRealPath();
+			if ( $real_path === false ) {
+				continue;
+			}
+			$real_path = wp_normalize_path( $real_path );
 
-				// Исключаем системные папки плагина
-				if ( str_starts_with( $relative_path, 'sbs-storage/' ) || str_starts_with( $relative_path, 'elementor/' ) ) {
-					continue;
-				}
+			if ( $real_path !== $base_real && ! str_starts_with( $real_path, $base_real . '/' ) ) {
+				continue;
+			}
 
-				// Главная оптимизация: Пропускаем сгенерированные миниатюры. 
-				// Если оригинального файла нет, то и его миниатюры не нужны (мы удалим оригинал, а WP не найдет миниатюру).
-				if ( preg_match( '/-[0-9]+x[0-9]+\.(jpg|jpeg|png|webp|gif|avif)$/i', $relative_path ) ) {
-					continue;
-				}
+			$relative = ltrim( substr( $real_path, strlen( $base_real ) ), '/' );
+			$relative = str_replace( '\\', '/', $relative );
 
-				// Если оригинального файла нет в базе - это сирота
-				if ( ! isset( $valid_lookup[ $relative_path ] ) ) {
-					$size         = $file->getSize();
-					$total_size  += $size;
-					$orphans[]    = [
-						'path' => $real_path,
-						'url'  => $base_url . $relative_path,
-						'size' => $size,
-					];
-				}
+			if ( str_starts_with( $relative, 'sbs-storage/' ) ) {
+				continue;
+			}
 
-				// Ограничитель, чтобы не повесить сервер при гигантских объемах (первые 500 сирот)
-				if ( count( $orphans ) >= 500 ) {
-					break;
-				}
+			if ( preg_match( '/-\d+x\d+\.(jpe?g|png|gif|webp|avif)$/i', $relative ) ) {
+				continue;
+			}
+
+			if ( isset( $valid_lookup[ $relative ] ) ) {
+				continue;
+			}
+
+			$size        = (int) $file->getSize();
+			$total_size += $size;
+			$orphans[]   = [
+				'path'     => $relative,
+				'abs_path' => $real_path,
+				'url'      => trailingslashit( $base_url ) . $relative,
+				'size'     => $size,
+			];
+
+			if ( count( $orphans ) >= 500 ) {
+				break;
 			}
 		}
 
 		wp_send_json_success( [
 			'orphans'    => $orphans,
 			'total_size' => $total_size,
-			'limit_hit'  => count( $orphans ) >= 500
+			'limit_hit'  => count( $orphans ) >= 500,
 		] );
 	}
 
@@ -87,21 +103,46 @@ final class MediaCleaner {
 		}
 
 		$files = $_POST['files'] ?? [];
-		if ( ! is_array( $files ) || empty( $files ) ) {
+		if ( ! is_array( $files ) || $files === [] ) {
 			wp_send_json_error( [ 'message' => __( 'No files specified.', 'sbs' ) ] );
 		}
 
 		$upload_dir = wp_upload_dir();
-		$base_dir   = $upload_dir['basedir'];
-		$deleted    = 0;
+		$base_dir   = isset( $upload_dir['basedir'] ) ? (string) $upload_dir['basedir'] : '';
+		$base_real  = $base_dir !== '' ? realpath( $base_dir ) : false;
+		if ( $base_real === false ) {
+			wp_send_json_error( [ 'message' => __( 'Uploads directory not found.', 'sbs' ) ] );
+		}
+		$base_real = wp_normalize_path( $base_real );
 
-		foreach ( $files as $path ) {
-			$path = sanitize_text_field( wp_unslash( $path ) );
-			// Строгая проверка, что путь действительно ведет в /uploads/ (Защита от удаления /etc/passwd)
-			if ( strpos( realpath( $path ), realpath( $base_dir ) ) === 0 ) {
-				if ( @unlink( $path ) ) {
-					$deleted++;
-				}
+		$deleted = 0;
+		foreach ( $files as $entry ) {
+			if ( is_array( $entry ) ) {
+				$candidate = (string) ( $entry['abs_path'] ?? $entry['path'] ?? '' );
+			} else {
+				$candidate = (string) $entry;
+			}
+			$candidate = wp_unslash( $candidate );
+			if ( $candidate === '' || str_contains( $candidate, "\0" ) ) {
+				continue;
+			}
+
+			if ( ! str_starts_with( $candidate, '/' ) && ! preg_match( '/^[A-Za-z]:\\\\/', $candidate ) ) {
+				$candidate = $base_real . '/' . ltrim( str_replace( '\\', '/', $candidate ), '/' );
+			}
+
+			$real = realpath( $candidate );
+			if ( $real === false ) {
+				continue;
+			}
+			$real = wp_normalize_path( $real );
+
+			if ( $real !== $base_real && ! str_starts_with( $real, $base_real . '/' ) ) {
+				continue;
+			}
+
+			if ( is_file( $real ) && @unlink( $real ) ) {
+				$deleted++;
 			}
 		}
 

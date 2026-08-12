@@ -5,118 +5,222 @@ declare(strict_types=1);
 namespace Vlad\SBS\Modules\Backup;
 
 use Vlad\SBS\Core\Logger;
+use Vlad\SBS\Core\SettingsManager;
 
+/**
+ * Builds ONE complete .zip: full site files + database.sql inside.
+ * Writes to *.zip.building, renames only on success (no half-dead part files in the list).
+ */
 final class ArchiveBuilder {
+
 	public function handle( array $payload ): void {
-		$exclude_thumbs = $payload['exclude_thumbs'] ?? true;
-		
-		$db_filename = 'sbs-database-dump-' . time() . '.sql';
-		$db_file     = WP_CONTENT_DIR . '/' . $db_filename;
-		
-		$dumper  = new DatabaseDumper();
-		$dumper->dump( $db_file );
+		$result = $this->create_backup( $payload );
 
-		$archive_file = SBS_STORAGE_DIR . 'backup-' . time();
-		
-		if ( $this->can_exec_tar() ) {
-			$archive_file .= '.tar.gz';
-			$this->compress_tar_exec( ABSPATH, $archive_file, $exclude_thumbs );
-		} else {
-			$archive_file .= '.zip';
-			$this->compress_zip_php( ABSPATH, $archive_file, $exclude_thumbs );
+		if ( empty( $result['path'] ) || ! file_exists( $result['path'] ) ) {
+			throw new \RuntimeException( 'Backup finished without a valid archive file.' );
 		}
 
-		if ( file_exists( $db_file ) ) {
-			@unlink( $db_file );
-		}
+		Logger::log( 'backup', 'info', 'Full backup completed.', [
+			'file' => basename( $result['path'] ),
+			'size' => $result['size'] ?? 0,
+		] );
 
-		// Фикс: жестко проверяем, собрал ли архиватор файл.
-		// Если файла нет, Exception будет перехвачен в JobQueue, и задача упадет в failed.
-		if ( ! file_exists( $archive_file ) || filesize( $archive_file ) === 0 ) {
-			throw new \RuntimeException( 'Archiver finished, but archive file is missing or empty.' );
-		}
-
-		Logger::log( 'backup', 'info', 'Full backup completed successfully.', [ 'file' => basename( $archive_file ) ] );
-
-		$uploader = new RemoteUploader();
-		$uploader->upload( $archive_file );
-	}
-
-	private function can_exec_tar(): bool {
-		if ( strtoupper( substr( PHP_OS, 0, 3 ) ) === 'WIN' ) {
-			return false;
-		}
-		if ( ! function_exists( 'exec' ) ) {
-			return false;
-		}
-		$disabled = explode( ',', ini_get( 'disable_functions' ) );
-		return ! in_array( 'exec', array_map( 'trim', $disabled ), true );
-	}
-
-	private function compress_tar_exec( string $source, string $destination, bool $exclude_thumbs ): void {
-		$exclude_cmd = '';
-		
-		if ( $exclude_thumbs ) {
-			$exclude_cmd = "--exclude='wp-content/uploads/*-[0-9]*x[0-9]*.jpg' " .
-			               "--exclude='wp-content/uploads/*-[0-9]*x[0-9]*.jpeg' " .
-			               "--exclude='wp-content/uploads/*-[0-9]*x[0-9]*.png' " .
-			               "--exclude='wp-content/uploads/*-[0-9]*x[0-9]*.webp' " .
-			               "--exclude='wp-content/uploads/*-[0-9]*x[0-9]*.avif' ";
-		}
-
-		$exclude_cmd .= "--exclude='wp-content/sbs-storage' ";
-
-		$command = sprintf(
-			'cd %s && tar %s -czf %s .',
-			escapeshellarg( $source ),
-			$exclude_cmd,
-			escapeshellarg( $destination )
-		);
-
-		// Фикс: отлавливаем код ошибки системной команды
-		exec( $command, $output, $result_code );
-		if ( $result_code !== 0 ) {
-			throw new \RuntimeException( "Tar command failed with exit code {$result_code}." );
+		// Optional remote upload (Pro settings).
+		if ( ! empty( $payload['upload_ftp'] ) || ! empty( $payload['upload_s3'] ) ) {
+			$uploader = new RemoteUploader();
+			$uploader->upload( $result['path'] );
 		}
 	}
 
-	private function compress_zip_php( string $source, string $destination, bool $exclude_thumbs ): void {
-		if ( ! class_exists( 'ZipArchive' ) ) {
-			throw new \RuntimeException( 'ZipArchive extension missing. Cannot create backup.' );
+	/**
+	 * @return array{path:string,file:string,size:int}
+	 */
+	public function create_backup( array $payload = [] ): array {
+		if ( ! class_exists( \ZipArchive::class ) ) {
+			throw new \RuntimeException( 'ZipArchive PHP extension is required for backups.' );
+		}
+
+		@set_time_limit( 0 );
+		@ini_set( 'memory_limit', '512M' );
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			ignore_user_abort( true );
+		}
+
+		if ( ! is_dir( SBS_STORAGE_DIR ) ) {
+			wp_mkdir_p( SBS_STORAGE_DIR );
+		}
+
+		// Drop stale incomplete archives from previous crashes.
+		$this->cleanup_incomplete_files();
+
+		$stamp     = gmdate( 'Ymd-His' );
+		$final     = SBS_STORAGE_DIR . 'backup-' . $stamp . '.zip';
+		$building  = $final . '.building';
+		$exclude_thumbs = ! empty( $payload['exclude_thumbs'] );
+
+		// 1) SQL dump to temp file (will be added into the zip, then deleted).
+		$sql_path = SBS_STORAGE_DIR . 'db-' . $stamp . '.sql';
+		$dumper   = new DatabaseDumper();
+		if ( ! $dumper->dump( $sql_path ) || ! file_exists( $sql_path ) ) {
+			throw new \RuntimeException( 'Database dump failed.' );
 		}
 
 		$zip = new \ZipArchive();
-		if ( $zip->open( $destination, \ZipArchive::CREATE | \ZipArchive::OVERWRITE ) !== true ) {
-			throw new \RuntimeException( "Failed to create zip archive at {$destination}" );
+		$opened = $zip->open( $building, \ZipArchive::CREATE | \ZipArchive::OVERWRITE );
+		if ( $opened !== true ) {
+			@unlink( $sql_path );
+			throw new \RuntimeException( 'Cannot create zip archive (code ' . $opened . ').' );
 		}
 
-		$files = new \RecursiveIteratorIterator(
-			new \RecursiveDirectoryIterator( $source, \RecursiveDirectoryIterator::SKIP_DOTS ),
-			\RecursiveIteratorIterator::LEAVES_ONLY
+		try {
+			// 2) Full site under ABSPATH.
+			$this->add_directory_to_zip( $zip, ABSPATH, '', $exclude_thumbs );
+
+			// 3) Database inside the same zip (single downloadable package).
+			$zip->addFile( $sql_path, 'database.sql' );
+
+			if ( ! $zip->close() ) {
+				throw new \RuntimeException( 'ZipArchive::close() failed.' );
+			}
+		} catch ( \Throwable $e ) {
+			@$zip->close();
+			@unlink( $building );
+			@unlink( $sql_path );
+			throw $e;
+		}
+
+		@unlink( $sql_path );
+
+		if ( ! file_exists( $building ) || filesize( $building ) === 0 ) {
+			@unlink( $building );
+			throw new \RuntimeException( 'Archive is missing or empty after close.' );
+		}
+
+		// Atomic publish: only complete zips are visible to restore/download UI.
+		if ( ! @rename( $building, $final ) ) {
+			@unlink( $building );
+			throw new \RuntimeException( 'Failed to finalize archive filename.' );
+		}
+
+		$this->apply_retention();
+
+		return [
+			'path' => $final,
+			'file' => basename( $final ),
+			'size' => (int) filesize( $final ),
+		];
+	}
+
+	private function add_directory_to_zip( \ZipArchive $zip, string $root, string $local_prefix, bool $exclude_thumbs ): void {
+		$root = trailingslashit( wp_normalize_path( $root ) );
+		$storage = trailingslashit( wp_normalize_path( SBS_STORAGE_DIR ) );
+
+		$iterator = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( $root, \FilesystemIterator::SKIP_DOTS ),
+			\RecursiveIteratorIterator::SELF_FIRST
 		);
 
-		foreach ( $files as $file ) {
+		foreach ( $iterator as $file ) {
+			/** @var \SplFileInfo $file */
+			$path = wp_normalize_path( $file->getPathname() );
+
+			// Never pack our own backup storage (avoids recursion + part files).
+			if ( str_starts_with( $path, $storage ) ) {
+				continue;
+			}
+
+			$relative = ltrim( substr( $path, strlen( $root ) ), '/' );
+			if ( $relative === '' ) {
+				continue;
+			}
+
+			// Skip noisy / unsafe paths.
+			if ( $this->should_skip( $relative, $exclude_thumbs ) ) {
+				continue;
+			}
+
+			$zip_path = $local_prefix !== '' ? $local_prefix . $relative : $relative;
+
 			if ( $file->isDir() ) {
-				continue;
-			}
-			
-			$file_path     = $file->getRealPath();
-			$relative_path = substr( $file_path, strlen( rtrim( $source, '/\\' ) ) + 1 );
-			$relative_path = str_replace( '\\', '/', $relative_path );
-
-			if ( str_starts_with( $relative_path, 'wp-content/sbs-storage' ) ) {
+				$zip->addEmptyDir( $zip_path );
 				continue;
 			}
 
-			if ( $exclude_thumbs && str_starts_with( $relative_path, 'wp-content/uploads' ) ) {
-				if ( preg_match( '/-[0-9]+x[0-9]+\.(jpg|jpeg|png|webp|avif)$/i', $relative_path ) ) {
-					continue;
-				}
+			if ( ! $file->isFile() || ! $file->isReadable() ) {
+				continue;
 			}
 
-			$zip->addFile( $file_path, $relative_path );
+			// addFile stores path reference — fine while zip still open and source exists.
+			$zip->addFile( $path, $zip_path );
 		}
-		
-		$zip->close();
+	}
+
+	private function should_skip( string $relative, bool $exclude_thumbs ): bool {
+		$relative = str_replace( '\\', '/', $relative );
+
+		$skip_prefixes = [
+			'wp-content/sbs-storage/',
+			'wp-content/cache/',
+			'wp-content/upgrade/',
+			'wp-content/updraft/',
+			'wp-content/ai1wm-backups/',
+			'wp-content/debug.log',
+		];
+
+		foreach ( $skip_prefixes as $prefix ) {
+			if ( str_starts_with( $relative, $prefix ) || $relative === rtrim( $prefix, '/' ) ) {
+				return true;
+			}
+		}
+
+		// Skip our incomplete artifacts if any leaked outside storage.
+		if ( preg_match( '/\.(building|tmp|part)$/i', $relative ) ) {
+			return true;
+		}
+
+		if ( $exclude_thumbs && str_starts_with( $relative, 'wp-content/uploads/' ) ) {
+			if ( preg_match( '/-\d+x\d+\.(jpe?g|png|gif|webp|avif)$/i', $relative ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	private function cleanup_incomplete_files(): void {
+		if ( ! is_dir( SBS_STORAGE_DIR ) ) {
+			return;
+		}
+		foreach ( glob( SBS_STORAGE_DIR . 'backup-*.{building,tmp,part}', GLOB_BRACE ) ?: [] as $stale ) {
+			@unlink( $stale );
+		}
+		foreach ( glob( SBS_STORAGE_DIR . 'db-*.sql' ) ?: [] as $stale_sql ) {
+			@unlink( $stale_sql );
+		}
+	}
+
+	private function apply_retention(): void {
+		$max = (int) SettingsManager::get( 'backup', 'retention_count', 14 );
+		if ( $max < 1 ) {
+			$max = 14;
+		}
+
+		$files = glob( SBS_STORAGE_DIR . 'backup-*.zip' ) ?: [];
+		// Only finalized zips.
+		$files = array_values( array_filter( $files, static function ( string $f ): bool {
+			return is_file( $f ) && ! str_ends_with( $f, '.building' );
+		} ) );
+
+		usort( $files, static function ( string $a, string $b ): int {
+			return filemtime( $b ) <=> filemtime( $a );
+		} );
+
+		$i = 0;
+		foreach ( $files as $file ) {
+			$i++;
+			if ( $i > $max ) {
+				@unlink( $file );
+			}
+		}
 	}
 }
