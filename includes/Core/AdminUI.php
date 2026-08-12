@@ -54,6 +54,9 @@ final class AdminUI {
 			$settings = [];
 		}
 
+		// Site license HMAC secret — only localized on this admin page for manage_options users.
+		$site_secret = LicenseManager::ensure_secret();
+
 		wp_localize_script( 'sbs-admin-js', 'sbsData', [
 			'ajaxUrl'          => admin_url( 'admin-ajax.php' ),
 			'adminUrl'         => admin_url( 'admin.php' ),
@@ -64,6 +67,7 @@ final class AdminUI {
 			'activeFreeModule' => $active_free_module,
 			'canSwitchModule'  => $this->license->can_switch_free_module(),
 			'switchDaysLeft'   => max( 0, 30 - $days_used ),
+			'licenseSecret'    => $site_secret,
 			'settings'         => $settings,
 			'i18n'             => [
 				'saved'        => __( 'Settings saved successfully.', 'sbs' ),

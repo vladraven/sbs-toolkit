@@ -86,18 +86,29 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function renderLicenseTab() {
+        const secret = window.sbsData.licenseSecret || '';
+        const secretDisplay = secret
+            ? `<code id="sbs-license-secret-value" style="display:block;word-break:break-all;background:#0b1220;color:#e2e8f0;padding:10px 12px;border-radius:6px;font-size:12px;margin-top:6px;">${secret}</code>
+               <button type="button" class="sbs-btn sbs-btn--secondary" id="sbs-btn-copy-secret" style="margin-top:8px;padding:6px 12px;font-size:12px;">Copy site secret</button>
+               <p style="font-size:12px;color:#64748b;margin:8px 0 0;">Use this secret + domain in the offline keygen to create a Pro key for <strong>this</strong> site only. Treat it like a password.</p>`
+            : `<p style="color:#b45309;font-size:13px;">Secret not available. Deactivate/reactivate the plugin or check wp-content/sbs-storage/.license_secret</p>`;
+
         return `
             <h2>License & Health Panel</h2>
-            <div style="display:flex; gap:20px;">
-                <div class="sbs-card" style="flex:1;">
+            <div style="display:flex; gap:20px; flex-wrap:wrap;">
+                <div class="sbs-card" style="flex:1; min-width:280px;">
                     <h3>License Management</h3>
                     <div class="sbs-form-group">
+                        <label>Site secret (for key generation)</label>
+                        ${secretDisplay}
+                    </div>
+                    <div class="sbs-form-group" style="margin-top:16px;">
                         <label>Pro License Key</label>
                         <input type="text" id="sbs-license-key-input" class="sbs-input" placeholder="SBS1-XXXX-XXXX-XXXX-XXXX">
                     </div>
                     <button class="sbs-btn" id="sbs-btn-activate">Activate Pro License</button>
                 </div>
-                <div class="sbs-card" style="flex:1;">
+                <div class="sbs-card" style="flex:1; min-width:280px;">
                     <h3>Configuration</h3>
                     <p>Transfer settings between sites via JSON.</p>
                     <div style="display:flex; gap:10px; margin-top: 15px;">
@@ -373,6 +384,27 @@ function renderPerformanceTab(isLocked) {
                 state.activeTab = el.dataset.tab;
                 render();
             });
+        });
+
+        const btnCopySecret = document.getElementById('sbs-btn-copy-secret');
+        if (btnCopySecret) btnCopySecret.addEventListener('click', async () => {
+            const el = document.getElementById('sbs-license-secret-value');
+            const text = el ? el.textContent : (window.sbsData.licenseSecret || '');
+            if (!text) return;
+            try {
+                await navigator.clipboard.writeText(text);
+                btnCopySecret.textContent = 'Copied';
+                setTimeout(() => { btnCopySecret.textContent = 'Copy site secret'; }, 1500);
+            } catch (e) {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                btnCopySecret.textContent = 'Copied';
+                setTimeout(() => { btnCopySecret.textContent = 'Copy site secret'; }, 1500);
+            }
         });
 
         const btnActivate = document.getElementById('sbs-btn-activate');
