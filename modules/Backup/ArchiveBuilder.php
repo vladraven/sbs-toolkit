@@ -25,7 +25,7 @@ final class ArchiveBuilder {
 			'size' => $result['size'] ?? 0,
 		] );
 
-		// Optional remote upload (Pro settings).
+		// Optional remote upload (flags from BackupModule; credentials from settings.backup.remote).
 		if ( ! empty( $payload['upload_ftp'] ) || ! empty( $payload['upload_s3'] ) ) {
 			$uploader = new RemoteUploader();
 			$uploader->upload( $result['path'] );
@@ -50,22 +50,22 @@ final class ArchiveBuilder {
 			wp_mkdir_p( SBS_STORAGE_DIR );
 		}
 
-		// Drop stale incomplete archives from previous crashes.
 		$this->cleanup_incomplete_files();
 
-		$stamp     = gmdate( 'Ymd-His' );
-		$final     = SBS_STORAGE_DIR . 'backup-' . $stamp . '.zip';
-		$building  = $final . '.building';
-		$exclude_thumbs = ! empty( $payload['exclude_thumbs'] );
+		$stamp          = gmdate( 'Ymd-His' );
+		$final          = SBS_STORAGE_DIR . 'backup-' . $stamp . '.zip';
+		$building       = $final . '.building';
+		$exclude_thumbs = array_key_exists( 'exclude_thumbs', $payload )
+			? (bool) $payload['exclude_thumbs']
+			: true;
 
-		// 1) SQL dump to temp file (will be added into the zip, then deleted).
 		$sql_path = SBS_STORAGE_DIR . 'db-' . $stamp . '.sql';
 		$dumper   = new DatabaseDumper();
 		if ( ! $dumper->dump( $sql_path ) || ! file_exists( $sql_path ) ) {
 			throw new \RuntimeException( 'Database dump failed.' );
 		}
 
-		$zip = new \ZipArchive();
+		$zip    = new \ZipArchive();
 		$opened = $zip->open( $building, \ZipArchive::CREATE | \ZipArchive::OVERWRITE );
 		if ( $opened !== true ) {
 			@unlink( $sql_path );
@@ -73,10 +73,7 @@ final class ArchiveBuilder {
 		}
 
 		try {
-			// 2) Full site under ABSPATH.
 			$this->add_directory_to_zip( $zip, ABSPATH, '', $exclude_thumbs );
-
-			// 3) Database inside the same zip (single downloadable package).
 			$zip->addFile( $sql_path, 'database.sql' );
 
 			if ( ! $zip->close() ) {
@@ -96,13 +93,13 @@ final class ArchiveBuilder {
 			throw new \RuntimeException( 'Archive is missing or empty after close.' );
 		}
 
-		// Atomic publish: only complete zips are visible to restore/download UI.
 		if ( ! @rename( $building, $final ) ) {
 			@unlink( $building );
 			throw new \RuntimeException( 'Failed to finalize archive filename.' );
 		}
 
-		$this->apply_retention();
+		// Free passes retention_count=1; Pro uses settings or payload override.
+		$this->apply_retention( $payload );
 
 		return [
 			'path' => $final,
@@ -112,7 +109,7 @@ final class ArchiveBuilder {
 	}
 
 	private function add_directory_to_zip( \ZipArchive $zip, string $root, string $local_prefix, bool $exclude_thumbs ): void {
-		$root = trailingslashit( wp_normalize_path( $root ) );
+		$root    = trailingslashit( wp_normalize_path( $root ) );
 		$storage = trailingslashit( wp_normalize_path( SBS_STORAGE_DIR ) );
 
 		$iterator = new \RecursiveIteratorIterator(
@@ -124,7 +121,6 @@ final class ArchiveBuilder {
 			/** @var \SplFileInfo $file */
 			$path = wp_normalize_path( $file->getPathname() );
 
-			// Never pack our own backup storage (avoids recursion + part files).
 			if ( str_starts_with( $path, $storage ) ) {
 				continue;
 			}
@@ -134,7 +130,6 @@ final class ArchiveBuilder {
 				continue;
 			}
 
-			// Skip noisy / unsafe paths.
 			if ( $this->should_skip( $relative, $exclude_thumbs ) ) {
 				continue;
 			}
@@ -150,7 +145,6 @@ final class ArchiveBuilder {
 				continue;
 			}
 
-			// addFile stores path reference — fine while zip still open and source exists.
 			$zip->addFile( $path, $zip_path );
 		}
 	}
@@ -173,7 +167,6 @@ final class ArchiveBuilder {
 			}
 		}
 
-		// Skip our incomplete artifacts if any leaked outside storage.
 		if ( preg_match( '/\.(building|tmp|part)$/i', $relative ) ) {
 			return true;
 		}
@@ -199,21 +192,36 @@ final class ArchiveBuilder {
 		}
 	}
 
-	private function apply_retention(): void {
-		$max = (int) SettingsManager::get( 'backup', 'retention_count', 14 );
+	/**
+	 * Keep newest N complete zips. N from payload['retention_count'] or settings (default 14).
+	 */
+	private function apply_retention( array $payload = [] ): void {
+		if ( isset( $payload['retention_count'] ) ) {
+			$max = (int) $payload['retention_count'];
+		} else {
+			$max = (int) SettingsManager::get( 'backup', 'retention_count', 14 );
+		}
+
 		if ( $max < 1 ) {
-			$max = 14;
+			$max = 1;
 		}
 
 		$files = glob( SBS_STORAGE_DIR . 'backup-*.zip' ) ?: [];
-		// Only finalized zips.
-		$files = array_values( array_filter( $files, static function ( string $f ): bool {
-			return is_file( $f ) && ! str_ends_with( $f, '.building' );
-		} ) );
+		$files = array_values(
+			array_filter(
+				$files,
+				static function ( string $f ): bool {
+					return is_file( $f ) && ! str_ends_with( $f, '.building' );
+				}
+			)
+		);
 
-		usort( $files, static function ( string $a, string $b ): int {
-			return filemtime( $b ) <=> filemtime( $a );
-		} );
+		usort(
+			$files,
+			static function ( string $a, string $b ): int {
+				return filemtime( $b ) <=> filemtime( $a );
+			}
+		);
 
 		$i = 0;
 		foreach ( $files as $file ) {
